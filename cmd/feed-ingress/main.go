@@ -22,6 +22,8 @@ import (
 	"github.com/sky-uk/feed/nginx"
 	"github.com/sky-uk/feed/util/cmd"
 	"github.com/sky-uk/feed/util/metrics"
+	"github.com/sky-uk/feed/gclb"
+	"errors"
 )
 
 var (
@@ -72,6 +74,8 @@ var (
 	merlinHealthTimeout            time.Duration
 	merlinVIP                      string
 	merlinVIPInterface             string
+	gclbInstanceGroupPrefix        string
+	gclbExpectedNumber             int
 )
 
 const (
@@ -123,6 +127,8 @@ const (
 	defaultMerlinHealthPeriod                = 10 * time.Second
 	defaultMerlinHealthTimeout               = time.Second
 	defaultMerlinVIPInterface                = "lo"
+	defaultGclbInstanceGroupPrefix           = ""
+	defaultGclbExpectedNumber                = 0
 )
 
 func init() {
@@ -204,18 +210,20 @@ func init() {
 	flag.IntVar(&nginxVhostStatsSharedMemory, "nginx-vhost-stats-shared-memory", defaultNginxVhostStatsSharedMemory,
 		"Memory (in MiB) which should be allocated for use by the vhost statistics module")
 
+	// elb/alb/gclb flags
+	flag.DurationVar(&drainDelay, "drain-delay", defaultDrainDelay, "Delay to wait"+
+		" for feed-ingress to drain from the registration component on shutdown. Should match the LB's drain time.")
+	flag.StringVar(&registrationFrontendType, "registration-frontend-type", defaultRegistrationFrontendType,
+		"Define the registration frontend type. Must be merlin, gorb, elb, alb or gclb.")
+
 	// elb/alb flags
 	flag.StringVar(&region, "region", defaultRegion,
 		"AWS region for frontend attachment.")
 	flag.StringVar(&elbLabelValue, "elb-label-value", defaultElbLabelValue,
 		"Attach to ELBs tagged with "+elb.ElbTag+"=value. Leave empty to not attach.")
-	flag.StringVar(&registrationFrontendType, "registration-frontend-type", defaultRegistrationFrontendType,
-		"Define the registration frontend type. Must be merlin, gorb, elb or alb.")
 	flag.IntVar(&elbExpectedNumber, "elb-expected-number", defaultElbExpectedNumber,
 		"Expected number of ELBs to attach to. If 0 the controller will not check,"+
 			" otherwise it fails to start if it can't attach to this number.")
-	flag.DurationVar(&drainDelay, "drain-delay", defaultDrainDelay, "Delay to wait"+
-		" for feed-ingress to drain from the registration component on shutdown. Should match the ELB's drain time.")
 	flag.Var(&targetGroupNames, "alb-target-group-names",
 		"Names of ALB target groups to attach to, separated by commas.")
 	flag.DurationVar(&targetGroupDeregistrationDelay, "alb-target-group-deregistration-delay",
@@ -276,6 +284,13 @@ func init() {
 	flag.StringVar(&merlinVIP, "merlin-vip", "", "VIP to assign to loopback to support direct route and tunnel.")
 	flag.StringVar(&merlinVIPInterface, "merlin-vip-interface", defaultMerlinVIPInterface,
 		"VIP interface to assign the VIP.")
+
+	// gclb flags
+	flag.StringVar(&gclbInstanceGroupPrefix, "gclb-instance-group-prefix", defaultGclbInstanceGroupPrefix,
+		"GCLB backend Instance Group prefix..")
+	flag.IntVar(&gclbExpectedNumber, "gclb-expected-number", defaultGclbExpectedNumber,
+		"Expected number of GCLBs to attach to. If 0 the controller will not check,"+
+			" otherwise it fails to start if it can't attach to this number.")
 }
 
 func main() {
@@ -328,22 +343,22 @@ func createIngressUpdaters() ([]controller.Updater, error) {
 	nginxUpdater := nginx.New(nginxConfig)
 
 	updaters := []controller.Updater{nginxUpdater}
+	frontendUpdater, err := createFrontendRegistrationUpdater()
+	if err != nil {
+		return updaters, err
+	}
+	updaters = append(updaters, frontendUpdater)
+	return updaters, nil
+}
 
+func createFrontendRegistrationUpdater() (updater controller.Updater, err error) {
 	switch registrationFrontendType {
 
 	case "elb":
-		elbUpdater, err := elb.New(region, elbLabelValue, elbExpectedNumber, drainDelay)
-		if err != nil {
-			return updaters, err
-		}
-		updaters = append(updaters, elbUpdater)
+		updater, err = elb.New(region, elbLabelValue, elbExpectedNumber, drainDelay)
 
 	case "alb":
-		albUpdater, err := alb.New(region, targetGroupNames, targetGroupDeregistrationDelay)
-		if err != nil {
-			return updaters, err
-		}
-		updaters = append(updaters, albUpdater)
+		updater, err = alb.New(region, targetGroupNames, targetGroupDeregistrationDelay)
 
 	case "gorb":
 		virtualServices, err := toVirtualServices(gorbServicesDefinition)
@@ -368,11 +383,7 @@ func createIngressUpdaters() ([]controller.Updater, error) {
 			BackendHealthcheckType:     gorbBackendHealthcheckType,
 			InterfaceProcFsPath:        gorbInterfaceProcFsPath,
 		}
-		gorbUpdater, err := gorb.New(&config)
-		if err != nil {
-			return updaters, err
-		}
-		updaters = append(updaters, gorbUpdater)
+		updater, err = gorb.New(&config)
 
 	case "merlin":
 		config := merlin.Config{
@@ -395,17 +406,23 @@ func createIngressUpdaters() ([]controller.Updater, error) {
 			VIP:                 merlinVIP,
 			VIPInterface:        merlinVIPInterface,
 		}
-		merlinUpdater, err := merlin.New(config)
-		if err != nil {
-			return updaters, err
-		}
-		updaters = append(updaters, merlinUpdater)
+		updater, err = merlin.New(config)
 
+	case "gclb":
+		if gclbInstanceGroupPrefix == "" {
+			return nil, errors.New("missing GCLB Instance Group prefix")
+		}
+
+		config := gclb.Config{
+			InstanceGroupPrefix: gclbInstanceGroupPrefix,
+			ExpectedFrontends:   gclbExpectedNumber,
+			DrainDelay:          drainDelay,
+		}
+		updater, err = gclb.New(config)
 	default:
 		return nil, fmt.Errorf("invalid registration frontend type. Must be either gorb, elb, alb but was %s", registrationFrontendType)
 	}
-
-	return updaters, nil
+	return updater, err
 }
 
 func toVirtualServices(servicesCsv string) ([]gorb.VirtualService, error) {
