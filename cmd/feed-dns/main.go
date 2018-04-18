@@ -3,8 +3,6 @@ package main
 import (
 	"flag"
 
-	"os"
-
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -15,6 +13,8 @@ import (
 	"github.com/sky-uk/feed/k8s"
 	"github.com/sky-uk/feed/util/cmd"
 	"github.com/sky-uk/feed/util/metrics"
+	"fmt"
+	"github.com/sky-uk/feed/dns/cdns"
 )
 
 var (
@@ -33,6 +33,9 @@ var (
 	internalHostname           string
 	externalHostname           string
 	cnameTimeToLive            time.Duration
+	dnsProvider                string
+	cdnsHostedZone             string
+	cdnsInstanceGroupPrefix    string
 )
 
 func init() {
@@ -45,6 +48,8 @@ func init() {
 		defaultPushgatewayIntervalSeconds = 60
 		defaultAwsAPIRetries              = 5
 		defaultCnameTTL                   = 5 * time.Minute
+		defaultCdnsInstanceGroupPrefix    = ""
+		defaultDnsProvider                = ""
 	)
 
 	flag.BoolVar(&debug, "debug", false,
@@ -60,7 +65,7 @@ func init() {
 	flag.StringVar(&elbRegion, "elb-region", defaultElbRegion,
 		"AWS region for ELBs.")
 	flag.StringVar(&elbLabelValue, "elb-label-value", defaultElbLabelValue,
-		"Alias to ELBs tagged with "+elb.ElbTag+"=value. Route53 entries will be created to these,"+
+		"Alias to ELBs tagged with " + elb.ElbTag + "=value. Route53 entries will be created to these,"+
 			"depending on the scheme.")
 	flag.StringVar(&r53HostedZone, "r53-hosted-zone", defaultHostedZone,
 		"Route53 hosted zone id to manage.")
@@ -78,25 +83,30 @@ func init() {
 		"Hostname of the internet facing load-balancer. If specified, internal-hostname must also be given.")
 	flag.DurationVar(&cnameTimeToLive, "cname-ttl", defaultCnameTTL,
 		"Time-to-live of CNAME records")
+
+	flag.StringVar(&cdnsHostedZone, "dns-provider", defaultDnsProvider,
+		"DNS provider to use. Valid values are: aws,gcp.")
+	flag.StringVar(&cdnsHostedZone, "cdns-hosted-zone", defaultHostedZone,
+		"Cloud DNS hosted zone name to manage.")
+	flag.StringVar(&cdnsInstanceGroupPrefix, "cdns-instance-group-prefix", defaultCdnsInstanceGroupPrefix,
+		"Prefix used to retrieve the GCLBs instance groups.")
 }
 
 func main() {
 	flag.Parse()
-	validateConfig()
 
 	cmd.ConfigureLogging(debug)
 	cmd.ConfigureMetrics("feed-dns", pushgatewayLabels, pushgatewayURL, pushgatewayIntervalSeconds)
 
 	client, err := k8s.New(kubeconfig, resyncPeriod)
 	if err != nil {
-		log.Fatal("Unable to create k8s client: ", err)
+		log.Fatalf("Unable to create k8s client: %v", err)
 	}
 
-	var lbAdapter, lbErr = createFrontendAdapter()
-	if lbErr != nil {
-		log.Fatal("Error during initialisation: ", lbErr)
+	dnsUpdater, err := createFrontendUpdater()
+	if err != nil {
+		log.Fatalf("Unable to create dns updater: %v", err)
 	}
-	dnsUpdater := dns.New(r53HostedZone, lbAdapter, awsAPIRetries)
 
 	controller := controller.New(controller.Config{
 		KubernetesClient: client,
@@ -114,42 +124,72 @@ func main() {
 	select {}
 }
 
-func createFrontendAdapter() (adapter.FrontendAdapter, error) {
-	if internalHostname != "" || externalHostname != "" {
-		addressesWithScheme := make(map[string]string)
-		if internalHostname != "" {
-			addressesWithScheme["internal"] = internalHostname
+func createFrontendUpdater() (controller.Updater, error) {
+	var dnsAdapter adapter.FrontendAdapter
+	var err error
+	switch dnsProvider {
+	case "aws":
+		validateAwsConfig()
+		if internalHostname != "" || externalHostname != "" {
+			addressesWithScheme := make(map[string]string)
+			if internalHostname != "" {
+				addressesWithScheme["internal"] = internalHostname
+			}
+
+			if externalHostname != "" {
+				addressesWithScheme["internet-facing"] = externalHostname
+			}
+
+			dnsAdapter = adapter.NewStaticHostnameAdapter(addressesWithScheme, cnameTimeToLive)
+		} else {
+
+			config := adapter.AWSAdapterConfig{
+				Region:        elbRegion,
+				HostedZoneID:  r53HostedZone,
+				ELBLabelValue: elbLabelValue,
+				ALBNames:      albNames,
+			}
+			dnsAdapter, err = adapter.NewAWSAdapter(&config)
+			if err != nil {
+				return nil, fmt.Errorf("unable to create aws adapater: %v", err)
+			}
 		}
+		return dns.New(r53HostedZone, dnsAdapter, awsAPIRetries), nil
 
-		if externalHostname != "" {
-			addressesWithScheme["internet-facing"] = externalHostname
+	case "gcp":
+		validateCdnsConfig()
+		config := cdns.Config{
+			InstanceGroupPrefix: cdnsInstanceGroupPrefix,
+			HostedZone:          cdnsHostedZone,
 		}
-
-		return adapter.NewStaticHostnameAdapter(addressesWithScheme, cnameTimeToLive), nil
+		dnsAdapter, err = cdns.NewAdapter(config)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create gcp adapater: %v", err)
+		}
+		return cdns.NewUpdater(config)
+	default:
+		return nil, fmt.Errorf("invalid dns-provider %q. Must specify a valid value: aws, gcp", dnsProvider)
 	}
-
-	config := adapter.AWSAdapterConfig{
-		Region:        elbRegion,
-		HostedZoneID:  r53HostedZone,
-		ELBLabelValue: elbLabelValue,
-		ALBNames:      albNames,
-	}
-	return adapter.NewAWSAdapter(&config)
 }
 
-func validateConfig() {
+func validateAwsConfig() {
 	if r53HostedZone == "" {
-		log.Error("Must supply r53-hosted-zone")
-		os.Exit(-1)
+		log.Fatal("Must supply r53-hosted-zone")
 	}
 
 	if elbLabelValue == "" && len(albNames) == 0 && internalHostname == "" && externalHostname == "" {
-		log.Error("Must specify at least one of alb-names, elb-label-value, internal-hostname or external-hostname")
-		os.Exit(-1)
+		log.Fatal("Must specify at least one of alb-names, elb-label-value, internal-hostname or external-hostname")
 	}
-
 	if (internalHostname != "" || externalHostname != "") && (elbLabelValue != "" || len(albNames) > 0) {
-		log.Error("Can't supply both ELB/ALB and non-ALB/ELB hostname. Choose one or the other.")
-		os.Exit(-1)
+		log.Fatal("Can't supply both ELB/ALB and non-ALB/ELB hostname. Choose one or the other.")
+	}
+}
+
+func validateCdnsConfig() {
+	if cdnsInstanceGroupPrefix == "" {
+		log.Fatalf("Must supply the cdns-instance-group-prefix value.")
+	}
+	if cdnsHostedZone == "" {
+		log.Fatalf("Must supply the cdns-hosted-zone name.")
 	}
 }
