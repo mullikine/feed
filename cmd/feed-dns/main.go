@@ -5,16 +5,17 @@ import (
 
 	"time"
 
+	"fmt"
+
 	log "github.com/sirupsen/logrus"
 	"github.com/sky-uk/feed/controller"
 	"github.com/sky-uk/feed/dns"
 	"github.com/sky-uk/feed/dns/adapter"
+	"github.com/sky-uk/feed/dns/cdns"
 	"github.com/sky-uk/feed/elb"
 	"github.com/sky-uk/feed/k8s"
 	"github.com/sky-uk/feed/util/cmd"
 	"github.com/sky-uk/feed/util/metrics"
-	"fmt"
-	"github.com/sky-uk/feed/dns/cdns"
 )
 
 var (
@@ -34,7 +35,7 @@ var (
 	externalHostname           string
 	cnameTimeToLive            time.Duration
 	dnsProvider                string
-	cdnsHostedZone             string
+	cdnsManagedZone            string
 	cdnsInstanceGroupPrefix    string
 )
 
@@ -49,7 +50,7 @@ func init() {
 		defaultAwsAPIRetries              = 5
 		defaultCnameTTL                   = 5 * time.Minute
 		defaultCdnsInstanceGroupPrefix    = ""
-		defaultDnsProvider                = ""
+		defaultDNSProvider                = ""
 	)
 
 	flag.BoolVar(&debug, "debug", false,
@@ -65,7 +66,7 @@ func init() {
 	flag.StringVar(&elbRegion, "elb-region", defaultElbRegion,
 		"AWS region for ELBs.")
 	flag.StringVar(&elbLabelValue, "elb-label-value", defaultElbLabelValue,
-		"Alias to ELBs tagged with " + elb.ElbTag + "=value. Route53 entries will be created to these,"+
+		"Alias to ELBs tagged with "+elb.ElbTag+"=value. Route53 entries will be created to these,"+
 			"depending on the scheme.")
 	flag.StringVar(&r53HostedZone, "r53-hosted-zone", defaultHostedZone,
 		"Route53 hosted zone id to manage.")
@@ -84,9 +85,9 @@ func init() {
 	flag.DurationVar(&cnameTimeToLive, "cname-ttl", defaultCnameTTL,
 		"Time-to-live of CNAME records")
 
-	flag.StringVar(&cdnsHostedZone, "dns-provider", defaultDnsProvider,
+	flag.StringVar(&dnsProvider, "dns-provider", defaultDNSProvider,
 		"DNS provider to use. Valid values are: aws,gcp.")
-	flag.StringVar(&cdnsHostedZone, "cdns-hosted-zone", defaultHostedZone,
+	flag.StringVar(&cdnsManagedZone, "cdns-hosted-zone", defaultHostedZone,
 		"Cloud DNS hosted zone name to manage.")
 	flag.StringVar(&cdnsInstanceGroupPrefix, "cdns-instance-group-prefix", defaultCdnsInstanceGroupPrefix,
 		"Prefix used to retrieve the GCLBs instance groups.")
@@ -108,16 +109,16 @@ func main() {
 		log.Fatalf("Unable to create dns updater: %v", err)
 	}
 
-	controller := controller.New(controller.Config{
+	dnsController := controller.New(controller.Config{
 		KubernetesClient: client,
 		Updaters:         []controller.Updater{dnsUpdater},
 	})
 
-	cmd.AddHealthMetrics(controller, metrics.PrometheusDNSSubsystem)
-	cmd.AddHealthPort(controller, healthPort)
-	cmd.AddSignalHandler(controller)
+	cmd.AddHealthMetrics(dnsController, metrics.PrometheusDNSSubsystem)
+	cmd.AddHealthPort(dnsController, healthPort)
+	cmd.AddSignalHandler(dnsController)
 
-	if err := controller.Start(); err != nil {
+	if err := dnsController.Start(); err != nil {
 		log.Fatal("Error while starting controller: ", err)
 	}
 
@@ -160,11 +161,7 @@ func createFrontendUpdater() (controller.Updater, error) {
 		validateCdnsConfig()
 		config := cdns.Config{
 			InstanceGroupPrefix: cdnsInstanceGroupPrefix,
-			HostedZone:          cdnsHostedZone,
-		}
-		dnsAdapter, err = cdns.NewAdapter(config)
-		if err != nil {
-			return nil, fmt.Errorf("unable to create gcp adapater: %v", err)
+			ManagedZone:         cdnsManagedZone,
 		}
 		return cdns.NewUpdater(config)
 	default:
@@ -189,7 +186,7 @@ func validateCdnsConfig() {
 	if cdnsInstanceGroupPrefix == "" {
 		log.Fatalf("Must supply the cdns-instance-group-prefix value.")
 	}
-	if cdnsHostedZone == "" {
+	if cdnsManagedZone == "" {
 		log.Fatalf("Must supply the cdns-hosted-zone name.")
 	}
 }
