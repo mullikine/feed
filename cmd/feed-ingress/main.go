@@ -40,6 +40,7 @@ var (
 	pushgatewayIntervalSeconds     int
 	pushgatewayLabels              cmd.KeyValues
 	controllerConfig               controller.Config
+	ingressName					   string
 	nginxConfig                    nginx.Conf
 	nginxLogHeaders                cmd.CommaSeparatedValues
 	nginxTrustedFrontends          cmd.CommaSeparatedValues
@@ -132,6 +133,7 @@ const (
 	defaultClientHeaderBufferSize            = 16
 	defaultClientBodyBufferSize              = 16
 	defaultLargeClientHeaderBufferBlocks     = 4
+	defaultIngressName						 = "main"
 )
 
 func init() {
@@ -160,6 +162,9 @@ func init() {
 			"Can be overridden with the sky.uk/strip-path annotation per ingress")
 	flag.IntVar(&healthPort, "health-port", defaultHealthPort,
 		"Port for checking the health of the ingress controller on /health. Also provides /debug/pprof.")
+	flag.StringVar(&ingressName, "ingress-name", defaultIngressName,
+		"Which ingress this instance is for.  This is used to filter ingresses so that only those with this"+
+		"ingress name will be updated.")
 
 	// nginx flags
 	flag.StringVar(&nginxConfig.BinaryLocation, "nginx-binary", defaultNginxBinary,
@@ -325,6 +330,8 @@ func main() {
 	if legacyBackendKeepaliveSeconds != unset {
 		controllerConfig.DefaultBackendTimeoutSeconds = legacyBackendKeepaliveSeconds
 	}
+
+	controllerConfig.IngressName = ingressName
 
 	feedController := controller.New(controllerConfig)
 
